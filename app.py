@@ -22,6 +22,12 @@ TABS = [('compile', 'Initial Compilation', '/'),
 TABS_JS = """<script>
 document.addEventListener('keydown', function (e) {
     if (!e.ctrlKey || e.key !== 'Tab') return;
+    if (window.isProcessing || (typeof runLock !== 'undefined' && runLock) || (typeof running !== 'undefined' && running)) {
+        if (!confirm("Files are currently loaded, loading, or processing. Do you want to continue switching tabs or cancel?")) {
+            e.preventDefault();
+            return;
+        }
+    }
     e.preventDefault();
     var tabs = Array.prototype.slice.call(document.querySelectorAll('.tabs a.tab'));
     var cur = tabs.findIndex(function (t) { return t.classList.contains('active'); });
@@ -29,17 +35,28 @@ document.addEventListener('keydown', function (e) {
     var next = (cur + (e.shiftKey ? -1 : 1) + tabs.length) % tabs.length;
     window.location.href = tabs[next].getAttribute('href');
 });
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('.tabs a.tab').forEach(function(tab) {
+        tab.addEventListener('click', function(e) {
+            if (window.isProcessing || (typeof runLock !== 'undefined' && runLock) || (typeof running !== 'undefined' && running)) {
+                if (!confirm("Files are currently loaded, loading, or processing. Do you want to continue switching tabs or cancel?")) {
+                    e.preventDefault();
+                }
+            }
+        });
+    });
+});
 </script>"""
 
 TABS_CSS = """
-.tabs { display: flex; justify-content: center; gap: 16px; padding: 40px 40px 0; background: #cfd5dc; }
+.tabs { display: flex; justify-content: center; gap: 16px; padding: 40px 40px 0; background: var(--tabs-bg, #cfd5dc); }
 .tabs.bleed { margin: -40px -40px 30px; }
-.tabs a.tab { position: relative; padding: 10px 24px; border-radius: 14px 14px 0 0; background: #e4e8ed; color: #4b5563; font-family: "Segoe UI", Arial, sans-serif; font-size: 13px; font-weight: 600; text-decoration: none; }
-.tabs a.tab:hover { background: #eef1f4; }
-.tabs a.tab.active { background: #f4f6f8; color: #1f2937; }
+.tabs a.tab { position: relative; padding: 10px 24px; border-radius: 14px 14px 0 0; background: var(--tab-bg, #e4e8ed); color: var(--tab-color, #4b5563); font-family: "Segoe UI", Arial, sans-serif; font-size: 13px; font-weight: 600; text-decoration: none; }
+.tabs a.tab:hover { background: var(--tab-hover-bg, #eef1f4); }
+.tabs a.tab.active { background: var(--tab-active-bg, #f4f6f8); color: var(--tab-active-color, #1f2937); }
 .tabs a.tab.active::before, .tabs a.tab.active::after { content: ''; position: absolute; bottom: 0; width: 14px; height: 14px; }
-.tabs a.tab.active::before { left: -14px; background: radial-gradient(circle at top left, transparent 14px, #f4f6f8 14.5px); }
-.tabs a.tab.active::after { right: -14px; background: radial-gradient(circle at top right, transparent 14px, #f4f6f8 14.5px); }
+.tabs a.tab.active::before { left: -14px; background: radial-gradient(circle at top left, transparent 14px, var(--tab-active-bg, #f4f6f8) 14.5px); }
+.tabs a.tab.active::after { right: -14px; background: radial-gradient(circle at top right, transparent 14px, var(--tab-active-bg, #f4f6f8) 14.5px); }
 """
 
 def tabs_html(active, bleed=False):
@@ -54,7 +71,7 @@ _RUNNING_LOCK = threading.Lock()
 # STREAMING VALIDATOR ENGINE WITH LIVE STAGES
 # ==========================================
 class TexValidatorStreamer:
-    DIFF_SECS_PER_PAGE = 2.0   # initial guess; replaced by the measured average after the first pages
+    DIFF_SECS_PER_PAGE = 2.0
 
     def __init__(self, file_path, engine='auto', ms_pdf=''):
         self.engine = engine
@@ -74,7 +91,7 @@ class TexValidatorStreamer:
     @staticmethod
     def _fmt_secs(s):
         s = int(round(s))
-        return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
+        return f"{s // 60:02d}:{s % 60:02d}"
 
     def _count_pages(self, *pdfs):
         import fitz
@@ -90,11 +107,10 @@ class TexValidatorStreamer:
         return max(counts)
 
     def _detect_engine(self):
-        # Returns (engine, uses_biber). Manual choice wins; otherwise pdflatex unless Lua/Unicode packages are found.
         uses_biber, eng = False, 'pdflatex'
         try:
             with open(self.file_path, 'r', encoding='utf-8-sig', errors='ignore') as f:
-                src = re.sub(r'(?m)(?<!\\)%.*$', '', f.read())   # ignore commented lines
+                src = re.sub(r'(?m)(?<!\\)%.*$', '', f.read())
         except Exception:
             return (self.engine if self.engine != 'auto' else eng), uses_biber
         bl = re.search(r'\\usepackage\s*(?:\[([^\]]*)\])?\s*\{biblatex\}', src)
@@ -115,7 +131,6 @@ class TexValidatorStreamer:
             yield f"data: {json.dumps({'status': 'error', 'message': 'A validation of this file is already running. Wait for it to finish.'})}\n\n"
             return
         try:
-            # Wrapper: records every stage event so the time report can be exported in the report html
             for chunk in self._run_pipeline_core():
                 try:
                     d = json.loads(chunk[6:].strip())
@@ -175,15 +190,16 @@ class TexValidatorStreamer:
         except Exception: pass
 
         try:
-            # Stage 1: Initial pdflatex compilation (draftmode)
+            # Stage 1
             yield f"data: {json.dumps({'stage_index': 0, 'step': f'1. {self.engine_name} Compiling (Draft Mode)', 'status': 'Running...', 'time': '...'})}\n\n"
             t0 = time.time()
             subprocess.run([pdflatex_exe, "-interaction=nonstopmode", "-draftmode", self.file_path],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", cwd=self.dir_name)
-            dur1 = f"{time.time() - t0:.2f}s"
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", cwd=self.dir_name,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            dur1 = self._fmt_secs(time.time() - t0)
             yield f"data: {json.dumps({'stage_index': 0, 'step': f'1. {self.engine_name} Compiling (Draft Mode)', 'status': 'Completed', 'time': dur1})}\n\n"
 
-            # Stage 2: Bibliography Processing
+            # Stage 2
             bcf_path = os.path.join(self.dir_name, f"{self.raw_base}.bcf")
             use_biber = (os.path.exists(bcf_path) or uses_biber_pkg) and os.path.exists(biber_exe)
             bib_tool_name = "biber" if use_biber else "bibtex"
@@ -192,12 +208,13 @@ class TexValidatorStreamer:
             yield f"data: {json.dumps({'stage_index': 1, 'step': f'2. Bibliography Processing ({bib_tool_name})', 'status': 'Running...', 'time': '...'})}\n\n"
             t0 = time.time()
             bib_res = subprocess.run([bib_tool, self.raw_base],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", cwd=self.dir_name)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", cwd=self.dir_name,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             bib_status = "Processed (Present)" if bib_res.returncode == 0 or os.path.exists(os.path.join(self.dir_name, f"{self.raw_base}.bbl")) else "Skipped / Not Required"
-            dur2 = f"{time.time() - t0:.2f}s"
+            dur2 = self._fmt_secs(time.time() - t0)
             yield f"data: {json.dumps({'stage_index': 1, 'step': f'2. Bibliography Processing ({bib_tool_name})', 'status': bib_status, 'time': dur2})}\n\n"
 
-# Stage 3 & 4: Smart Full Compilation passes (stops early if stable)
+            # Stages 3 & 4
             total_full_passes = 3 if has_toc else 1
             s_idx = 2
             for pass_idx in range(total_full_passes):
@@ -207,11 +224,11 @@ class TexValidatorStreamer:
                 yield f"data: {json.dumps({'stage_index': current_s_idx, 'step': pass_label, 'status': 'Running...', 'time': '...'})}\n\n"
                 t0 = time.time()
                 subprocess.run([pdflatex_exe, "-interaction=nonstopmode", self.file_path],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", cwd=self.dir_name)
-                dur_pass = f"{time.time() - t0:.2f}s"
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", cwd=self.dir_name,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                dur_pass = self._fmt_secs(time.time() - t0)
                 yield f"data: {json.dumps({'stage_index': current_s_idx, 'step': pass_label, 'status': 'Completed', 'time': dur_pass})}\n\n"
 
-                # Check if LaTeX log requests another rerun
                 need_rerun = False
                 if os.path.exists(self.log_path):
                     with open(self.log_path, 'r', encoding='utf-8', errors='ignore') as lf:
@@ -219,7 +236,6 @@ class TexValidatorStreamer:
                         if "Rerun to get cross-references right" in log_content or "Label(s) may have changed" in log_content:
                             need_rerun = True
                 
-                # If LaTeX says no further reruns are needed, stop early
                 if not need_rerun and pass_idx >= 1:
                     break
 
@@ -242,7 +258,7 @@ class TexValidatorStreamer:
             diff_step = '5. Diff PDF Preparation'
             n_pages = self._count_pages(new_pdf, ms_pdf)
             est = n_pages * self.DIFF_SECS_PER_PAGE
-            first_status = f"Running... {n_pages} pages, est. ~{self._fmt_secs(est)} - please wait" if n_pages else "Running..."
+            first_status = f"Running... {n_pages} pages, est. ~{int(est)}s - please wait" if n_pages else "Running..."
             yield f"data: {json.dumps({'stage_index': 5, 'step': diff_step, 'status': first_status, 'time': '...'})}\n\n"
             t0 = time.time()
 
@@ -256,22 +272,21 @@ class TexValidatorStreamer:
                 finally:
                     q.put(None)
             threading.Thread(target=_worker, daemon=True).start()
-			
 
             while True:
                 try:
                     item = q.get(timeout=5)
                 except queue.Empty:
-                    yield ": keepalive\n\n"      # keeps the stream alive during a slow page
+                    yield ": keepalive\n\n"
                     continue
                 if item is None:
                     break
                 done, total = item
                 left = ((time.time() - t0) / done * (total - done)) if done > 0 else est
-                prog_status = f"Running... page {done}/{total}, ~{self._fmt_secs(left)} left"
+                prog_status = f"Running... page {done}/{total}, ~{int(left)}s left"
                 yield f"data: {json.dumps({'stage_index': 5, 'step': diff_step, 'status': prog_status, 'time': '...'})}\n\n"
 
-            dur5 = f"{time.time() - t0:.2f}s"
+            dur5 = self._fmt_secs(time.time() - t0)
             if self.diff_report:
                 diff_status = 'Completed'
             else:
@@ -283,7 +298,6 @@ class TexValidatorStreamer:
         self.elapsed_time = time.time() - start_time
         report_url = self.generate_html_report()
         
-        # Final finish signal containing report redirect URL
         yield f"data: {json.dumps({'status': 'finished', 'report_url': f'/get_report_file?path={report_url}'})}\n\n"
 
     def _parse_log_file(self, log_path):
@@ -308,7 +322,6 @@ class TexValidatorStreamer:
             if not found: self.missing_items.append(f"Graphic asset/Image file not found: <strong>{img}</strong>")
 
     def _check_missing_from_log(self):
-        # Adds files reported missing in the TeX log (pictures, \input/\include files, .sty/.cls, ...)
         log = ""
         for p in (self.log_path, os.path.join(self.dir_name, f"{self.raw_base}.blg")):
             if os.path.exists(p):
@@ -319,8 +332,8 @@ class TexValidatorStreamer:
         patterns = [r"File\s+[`']([^'`]{1,200})'\s+not\s+found",
                     r"Unable to load picture or PDF file\s*[`'\"]([^'`\"]{1,200})[`'\"]",
                     r"I can't find file\s+[`']([^'`]{1,200})'",
-                    r"Cannot find\s+(?:control file\s+)?[`'\"]([^'`\"]{1,200})[`'\"]",   # biber .blg
-                    r"I couldn't open (?:database|style) file\s+(\S{1,200})"]            # bibtex .blg
+                    r"Cannot find\s+(?:control file\s+)?[`'\"]([^'`\"]{1,200})[`'\"]",
+                    r"I couldn't open (?:database|style) file\s+(\S{1,200})"]
         for pat in patterns:
             for m in re.finditer(pat, log):
                 name = m.group(1).replace('\n', '').strip()
@@ -350,42 +363,21 @@ class TexValidatorStreamer:
             if tag == 'equal':
                 continue
             text_changed = True
-            if tag in ('replace', 'delete'):   # only in MS -> red
+            if tag in ('replace', 'delete'):
                 for w in words_ms[i1:i2]:
                     r = fitz.Rect(w[0] * scale, w[1] * scale + header_h, w[2] * scale, w[3] * scale + header_h)
                     pg.draw_rect(r, color=None, fill=(1, 0, 0), fill_opacity=0.35)
-            if tag in ('replace', 'insert'):   # only in new -> green
+            if tag in ('replace', 'insert'):
                 for w in words_new[j1:j2]:
                     r = fitz.Rect(pm.width + w[0] * scale, w[1] * scale + header_h, pm.width + w[2] * scale, w[3] * scale + header_h)
                     pg.draw_rect(r, color=None, fill=(0, 0.7, 0.2), fill_opacity=0.35)
-        if text_changed:
-            return
-        # Same text but different pixels -> graphic / layout change: orange row bands
-        buf_ms, buf_new = pm.samples, pn.samples
-        w_px = min(pm.width, pn.width) * pm.n
-        rows = min(pm.height, pn.height)
-        bands, start, last = [], None, None
-        for y in range(rows):
-            a = buf_ms[y * pm.stride: y * pm.stride + w_px]
-            b = buf_new[y * pn.stride: y * pn.stride + w_px]
-            if a != b:
-                if start is None:
-                    start = y
-                last = y
-            elif start is not None and y - last > 12:
-                bands.append((start, last))
-                start = None
-        if start is not None:
-            bands.append((start, last))
-        for y0, y1 in bands:
-            top, bottom = y0 + header_h - 3, y1 + header_h + 3
-            pg.draw_rect(fitz.Rect(0, top, pm.width, bottom), color=None, fill=(1, 0.55, 0), fill_opacity=0.3)
-            pg.draw_rect(fitz.Rect(pm.width, top, pm.width + pn.width, bottom), color=None, fill=(1, 0.55, 0), fill_opacity=0.3)
+        return text_changed
 
     def _compare_pdfs(self, new_pdf, ms_pdf, progress=None):
         try:
             import fitz
             import os
+            import difflib
             dn = fitz.open(new_pdf)
             dm = fitz.open(ms_pdf)
             diff_doc = fitz.open()
@@ -394,51 +386,43 @@ class TexValidatorStreamer:
             
             for i in range(max_pages):
                 if progress: progress(i, max_pages)
-                # 1. Structural catch for uneven lengths (never misses deleted/added pages)
                 if i >= dn.page_count or i >= dm.page_count:
                     pages_diff += 1
                     continue
                 
-                # 2. Extract structural text layouts first to bypass anti-aliasing false positives
-                text_n = dn[i].get_text("blocks")
-                text_m = dm[i].get_text("blocks")
+                words_ms = dm[i].get_text("words")
+                words_new = dn[i].get_text("words")
+                matcher = difflib.SequenceMatcher(None, [w[4] for w in words_ms], [w[4] for w in words_new], autojunk=False)
+                has_text_diff = any(tag != 'equal' for tag, _, _, _, _ in matcher.get_opcodes())
                 
-                # Render 150 DPI RGB pixmaps for background comparison
+                if not has_text_diff:
+                    continue  # Skip pages with zero text differences completely
+                    
+                pages_diff += 1
                 pn = dn[i].get_pixmap(dpi=150, colorspace=fitz.csRGB)
                 pm = dm[i].get_pixmap(dpi=150, colorspace=fitz.csRGB)
                 
-                # 3. Only mark as changed if actual text blocks differ OR structural layout arrays do
-                if text_n != text_m or pn.samples != pm.samples:
-                    # Final sanity double-check to filter out hidden sub-pixel variance 
-                    # If text matches exactly and pixel variance is negligible, skip false alerts
-                    if text_n == text_m and abs(len(pn.samples) - len(pm.samples)) == 0:
-                        # Quick check if it's just minor noise in compression
-                        if pn.samples[:1000] == pm.samples[:1000] and pn.samples[-1000:] == pm.samples[-1000:]:
-                            continue
-                            
-                    pages_diff += 1
-                    header_h = 40
-                    w = pm.width + pn.width
-                    h = max(pm.height, pn.height) + header_h
-                    
-                    pg = diff_doc.new_page(width=w, height=h)
-                    pg.draw_rect(fitz.Rect(0, 0, w, header_h), color=None, fill=(0.95, 0.95, 0.95))
-                    pg.insert_text(fitz.Point(20, 26), f"Manuscript (MS) - Page {i + 1}", fontsize=13, color=(0.8, 0.1, 0.1))
-                    pg.insert_text(fitz.Point(300, 26), "red = removed/changed text | orange = graphic/layout change", fontsize=10, color=(0.4, 0.4, 0.4))
-                    pg.insert_text(fitz.Point(pm.width + 310, 26), "green = added/changed text | orange = graphic/layout change", fontsize=10, color=(0.4, 0.4, 0.4))
-                    
-                    pg.insert_image(fitz.Rect(0, header_h, pm.width, pm.height + header_h), stream=pm.tobytes("png"))
-                    pg.insert_image(fitz.Rect(pm.width, header_h, pm.width + pn.width, pn.height + header_h), stream=pn.tobytes("png"))
-                    
-                    if hasattr(self, '_highlight_diff'):
-                        self._highlight_diff(pg, dm[i], dn[i], pm, pn, header_h)
+                header_h = 40
+                w = pm.width + pn.width
+                h = max(pm.height, pm.height) + header_h
+                
+                pg = diff_doc.new_page(width=w, height=h)
+                pg.draw_rect(fitz.Rect(0, 0, w, header_h), color=None, fill=(0.95, 0.95, 0.95))
+                pg.insert_text(fitz.Point(20, 26), f"Manuscript (MS) - Page {i + 1}", fontsize=13, color=(0.8, 0.1, 0.1))
+                pg.insert_text(fitz.Point(300, 26), "red = removed/changed text", fontsize=10, color=(0.4, 0.4, 0.4))
+                pg.insert_text(fitz.Point(pm.width + 310, 26), "green = added/changed text", fontsize=10, color=(0.4, 0.4, 0.4))
+                
+                pg.insert_image(fitz.Rect(0, header_h, pm.width, pm.height + header_h), stream=pm.tobytes("png"))
+                pg.insert_image(fitz.Rect(pm.width, header_h, pm.width + pn.width, pn.height + header_h), stream=pn.tobytes("png"))
+                
+                if hasattr(self, '_highlight_diff'):
+                    self._highlight_diff(pg, dm[i], dn[i], pm, pn, header_h)
                         
             self.pages_diff_count = pages_diff
             
-            # --- ALERT MECHANISM: Handle case where no visual differences were found ---
             if diff_doc.page_count == 0:
                 pg = diff_doc.new_page(width=600, height=200)
-                pg.draw_rect(fitz.Rect(0, 0, 600, 200), color=None, fill=(0.92, 0.97, 0.94))  # Soft green alert bg
+                pg.draw_rect(fitz.Rect(0, 0, 600, 200), color=None, fill=(0.92, 0.97, 0.94))
                 pg.insert_text(fitz.Point(40, 95), "✔ No Visual or Text Layout Differences Found!", fontsize=18, color=(0.02, 0.45, 0.24))
                 pg.insert_text(fitz.Point(40, 125), "Both PDF documents match exactly at 150 DPI.", fontsize=12, color=(0.3, 0.3, 0.3))
                 pg.insert_text(fitz.Point(40, 150), f"Manuscript (MS) PDF : {os.path.basename(ms_pdf)}", fontsize=10, color=(0.3, 0.3, 0.3))
@@ -455,7 +439,6 @@ class TexValidatorStreamer:
             return None
 
     def _compare_pdfs_isolated(self, new_pdf, ms_pdf, progress=None):
-        # Runs the diff in a child process so a native crash / out-of-memory cannot kill the app
         cmd = [sys.executable] + ([] if getattr(sys, 'frozen', False) else [os.path.abspath(__file__)]) + ['--diff', self.file_path, new_pdf, ms_pdf]
         result, err, tail = None, None, []
         try:
@@ -491,12 +474,12 @@ class TexValidatorStreamer:
 
         mins = int(self.elapsed_time // 60)
         secs = int(self.elapsed_time % 60)
-        formatted_exec_time = f"{mins}mins {secs}sec"
+        formatted_exec_time = f"{mins:02d}:{secs:02d}"
 
         cards_html = f'''
         <div class="card"><div class="num">{total_errors}</div><div class="lbl">Compilation Errors</div></div>
         <div class="card"><div class="num">{total_missing}</div><div class="lbl">Missing Materials</div></div>
-        <div class="card"><div class="num" style="color:#2563eb; font-size:22px;">{formatted_exec_time}</div><div class="lbl">Execution Time</div></div>
+        <div class="card"><div class="num" style="color:#2563eb; font-size:22px;">{formatted_exec_time}</div><div class="lbl">Execution Time (MM:SS)</div></div>
         '''
 
         files_html = ""
@@ -508,7 +491,6 @@ class TexValidatorStreamer:
         if self.errors:
             import html
             def _pattern(domain, msg):
-                # Turn the variable parts (file names, quoted names, numbers) into placeholders so similar errors share one key
                 p = re.sub(r"`[^'`\n]*'", "`…'", msg)
                 p = re.sub(r'"[^"\n]*"', '"…"', p)
                 p = re.sub(r'\bEnvironment\s+\S+\s+undefined', 'Environment … undefined', p)
@@ -549,37 +531,89 @@ class TexValidatorStreamer:
 <html lang="en">
 <head>
 <meta charset="UTF-8"><title>LaTeX Error Report</title>
+<script>
+    (function() {
+        const savedTheme = localStorage.getItem('latex_theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+    })();
+</script>
 <style>
+.nav-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.theme-switch-btn { background: var(--tab-bg); border: 1px solid var(--border-color); border-radius: 30px; width: 68px; height: 34px; display: flex; align-items: center; justify-content: space-between; padding: 0 4px; cursor: pointer; position: relative; transition: background 0.3s; }
+.theme-switch-btn .icon { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; z-index: 2; transition: transform 0.3s, background 0.3s; }
+.theme-switch-btn .sun { color: #f59e0b; }
+.theme-switch-btn .moon { color: #94a3b8; }
+:root[data-theme="dark"] .theme-switch-btn .sun { color: #64748b; }
+:root[data-theme="dark"] .theme-switch-btn .moon { color: #38bdf8; }
+.theme-switch-btn .knob { position: absolute; left: 4px; width: 26px; height: 26px; border-radius: 50%; background: #ffffff; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: transform 0.3s; z-index: 1; }
+:root[data-theme="dark"] .theme-switch-btn .knob { transform: translateX(34px); background: #262626; }
+:root {
+    --bg-color: #f4f6f8;
+    --text-color: #1f2937;
+    --card-bg: #fff;
+    --border-color: #e5e7eb;
+    --meta-color: #6b7280;
+    --pre-bg: #f9fafb;
+    --tabs-bg: #cfd5dc;
+    --tab-bg: #e4e8ed;
+    --tab-color: #4b5563;
+    --tab-hover-bg: #eef1f4;
+    --tab-active-bg: #f4f6f8;
+    --tab-active-color: #1f2937;
+}
+:root[data-theme="dark"] {
+    --bg-color: #000000;
+    --text-color: #f3f4f6;
+    --card-bg: #121212;
+    --border-color: #262626;
+    --meta-color: #94a3b8;
+    --pre-bg: #0a0a0a;
+    --tabs-bg: #000000;
+    --tab-bg: #121212;
+    --tab-color: #94a3b8;
+    --tab-hover-bg: #222222;
+    --tab-active-bg: #000000;
+    --tab-active-color: #f3f4f6;
+}
 @@TABS_CSS@@
 .nav-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
-.next-step-btn { background: #059669; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 13px; }
-.next-step-btn:hover { background: #047857; }
-.bottom-nav { display: flex; justify-content: flex-end; margin: 24px 0 10px; }
-.arrow-btn { color: #059669; font-size: 30px; font-weight: 700; line-height: 1; text-decoration: none; }
-.arrow-btn:hover { color: #047857; }
-body { margin: 0; background: #f4f6f8; color: #1f2937; font-family: "Segoe UI", Arial, sans-serif; font-size: 14px; }
+.theme-switch-btn { background: var(--tab-bg); border: 1px solid var(--border-color); border-radius: 30px; width: 68px; height: 34px; display: flex; align-items: center; justify-content: space-between; padding: 0 4px; cursor: pointer; position: relative; transition: background 0.3s; }
+.theme-switch-btn .icon { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; z-index: 2; transition: transform 0.3s, background 0.3s; }
+.theme-switch-btn .sun { color: #f59e0b; }
+.theme-switch-btn .moon { color: #94a3b8; }
+:root[data-theme="dark"] .theme-switch-btn .sun { color: #64748b; }
+:root[data-theme="dark"] .theme-switch-btn .moon { color: #38bdf8; }
+.theme-switch-btn .knob { position: absolute; left: 4px; width: 26px; height: 26px; border-radius: 50%; background: #ffffff; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: transform 0.3s; z-index: 1; }
+:root[data-theme="dark"] .theme-switch-btn .knob { transform: translateX(34px); background: #262626; }
+body { margin: 0; background: var(--bg-color); color: var(--text-color); font-family: "Segoe UI", Arial, sans-serif; font-size: 14px; transition: background 0.3s, color 0.3s; }
 .wrap { max-width: 1100px; margin: 30px auto; padding: 0 16px; }
 h1 { margin: 0 0 4px; font-size: 26px; }
-.meta { color: #6b7280; margin-bottom: 20px; }
+.meta { color: var(--meta-color); margin-bottom: 20px; font-family: Consolas, monospace; word-break: break-all; }
 .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
-.card { flex: 1; min-width: 150px; background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+.card { flex: 1; min-width: 150px; background: var(--card-bg); border-radius: 12px; padding: 16px; box-shadow: 0 2px 10px rgba(0,0,0,.06); border: 1px solid var(--border-color); }
 .num { font-size: 28px; font-weight: 700; color: #b91c1c; }
-.lbl { color: #6b7280; margin-top: 2px; }
+.lbl { color: var(--meta-color); margin-top: 2px; }
 .actions { display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px; }
 .action-btn { padding: 10px 18px; color: white; border: none; border-radius: 8px; font-weight: 600; font-size: 13px; cursor: pointer; display: inline-block; }
 .action-btn:hover { opacity: 0.9; }
-.viewer-container { margin-bottom: 30px; background: white; padding: 12px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.06); display: none; }
+.viewer-container { margin-bottom: 30px; background: var(--card-bg); padding: 12px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.06); display: none; border: 1px solid var(--border-color); }
 .viewer-header { display: flex; justify-content: flex-end; margin-bottom: 8px; }
 .new-tab-icon { color: #2563eb; text-decoration: none; font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 4px; }
 .new-tab-icon:hover { text-decoration: underline; }
-iframe { width: 100%; height: 550px; border: 1px solid #e5e7eb; border-radius: 8px; }
-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.04); }
-th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid #eef0f3; }
-details.group { background: #fff; border-radius: 10px; margin-bottom: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.05); overflow: hidden; }
-details > summary { cursor: pointer; padding: 11px 14px; display: flex; align-items: center; gap: 10px; font-weight: 600; }
+iframe { width: 100%; height: 550px; border: 1px solid var(--border-color); border-radius: 8px; background: #fff; }
+table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.04); border: 1px solid var(--border-color); }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border-color); color: var(--text-color); }
+details.group, details.collapsible-section { background: var(--card-bg); border-radius: 10px; margin-bottom: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.05); overflow: hidden; border: 1px solid var(--border-color); }
+details > summary { cursor: pointer; padding: 11px 14px; display: flex; align-items: center; gap: 10px; font-weight: 600; list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before { content: '▶'; display: inline-block; font-size: 11px; transition: transform 0.2s; color: var(--meta-color); margin-right: 4px; }
+details[open] > summary::before { transform: rotate(90deg); }
 .badge { min-width: 42px; text-align: center; padding: 2px 8px; border-radius: 999px; background: #fee2e2; color: #b91c1c; font-size: 12px; }
 .ok { background: #ecfdf5; color: #047857; padding: 18px; border-radius: 10px; font-weight: 600; margin-top: 20px; }
-pre.extra { margin: 0; padding: 10px 14px; background: #f9fafb; color: #4b5563; font-size: 12.5px; white-space: pre-wrap; }
+pre.extra { margin: 0; padding: 10px 14px; background: var(--pre-bg); color: var(--text-color); font-size: 12.5px; white-space: pre-wrap; }
+details.collapsible-section { margin-top: 28px; }
+details.collapsible-section > summary { padding: 14px 18px; font-size: 16px; }
+details.collapsible-section[open] > summary { border-bottom: 1px solid var(--border-color); }
 </style>
 </head>
 <body>
@@ -587,6 +621,11 @@ pre.extra { margin: 0; padding: 10px 14px; background: #f9fafb; color: #4b5563; 
 <div class="wrap">
 <div class="nav-header">
     <h1>LaTeX Error Report</h1>
+    <div class="theme-switch-btn" onclick="toggleTheme()" title="Toggle Dark/Light Mode">
+        <div class="knob"></div>
+        <div class="icon sun">☀️</div>
+        <div class="icon moon">🌙</div>
+    </div>
 </div>
 <div class="meta"><b>@@TITLE@@</b></div>
 <div class="cards">@@CARDS@@</div>
@@ -607,7 +646,6 @@ function showFrame(url) {
     const box = document.getElementById('viewerBox');
     const frame = document.getElementById('fileFrame');
     const newTabLink = document.getElementById('newTabLink');
-    // Second click on the same button hides the viewer
     if (box.style.display === 'block' && currentUrl === url) {
         box.style.display = 'none';
         frame.src = 'about:blank';
@@ -620,16 +658,23 @@ function showFrame(url) {
     box.style.display = 'block';
     box.scrollIntoView({ behavior: 'smooth' });
 }
+function toggleTheme() {
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    const nextTheme = isDark ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', nextTheme);
+    localStorage.setItem('latex_theme', nextTheme);
+}
 </script>
 </body>
 </html>
 """
         time_rows = "".join(f"<tr><td>{r['step']}</td><td>{r['status']}</td><td>{r['started']}</td><td>{r['time']}</td></tr>" for _, r in sorted(self.stage_rows.items()))
-        time_html = f'<h2 style="margin-top:28px;">Execution Time Report</h2><table class="files" style="margin-bottom:24px;"><thead><tr><th>Pipeline Stage</th><th>Status</th><th>Started In</th><th>Duration</th></tr></thead><tbody>{time_rows}</tbody></table>' if time_rows else ''
+        time_html = f'''<details class="collapsible-section"><summary>Execution Time Report (MM:SS)</summary><table class="files" style="margin:0; border:none; box-shadow:none;"><thead><tr><th>Pipeline Stage</th><th>Status</th><th>Started In</th><th>Duration</th></tr></thead><tbody>{time_rows}</tbody></table></details>''' if time_rows else ''
+        
         report_html = (TEMPLATE
             .replace("@@TABS_CSS@@", TABS_CSS)
             .replace("@@TABS@@", tabs_html('compile'))
-            .replace("@@TITLE@@", f"{self.raw_base}.tex")
+            .replace("@@TITLE@@", self.file_path)
             .replace("@@CARDS@@", cards_html)
             .replace("@@DIFF_BTN@@", diff_btn_html)
             .replace("@@LOG_BTN@@", log_btn_html)
@@ -637,14 +682,12 @@ function showFrame(url) {
             .replace("@@FILES@@", files_html)
             .replace("@@GROUPS@@", groups_html)
         )
-        # Exported file: no app-only buttons / viewer / script
         export_html = report_html.replace(groups_html, '')
         for pat in (r'<nav class="tabs.*?</nav>', r'<div class="actions">.*?</div>',
                     r'<div id="viewerBox".*?</iframe>\s*</div>', r'<script>\s*let currentUrl.*?</script>'):
             export_html = re.sub(pat, '', export_html, flags=re.S)
         report_name = os.path.join(self.dir_name, f"{self.raw_base}_report.html")
         with open(report_name, "w", encoding="utf-8") as f: f.write(export_html)
-        # App view (with buttons) goes to the temp folder so the project folder only gets the clean export
         import tempfile
         app_name = os.path.join(tempfile.gettempdir(), f"{self.raw_base}_report_app.html")
         with open(app_name, "w", encoding="utf-8") as f: f.write(report_html)
@@ -660,49 +703,84 @@ def index():
     return render_template_string(r'''
     <!DOCTYPE html>
     <html lang="en">
-    <head><title>Step 1: LaTeX Project Validator</title>
+    <head>
+    <meta charset="UTF-8"><title>Step 1: LaTeX Project Validator</title>
+    <script>
+        (function() {
+            const savedTheme = localStorage.getItem('latex_theme') || 'dark';
+            document.documentElement.setAttribute('data-theme', savedTheme);
+        })();
+    </script>
     <style>
+        :root {
+            --bg-color: #000000;
+            --text-color: #f3f4f6;
+            --card-bg: #121212;
+            --border-color: #262626;
+            --meta-color: #94a3b8;
+            --tabs-bg: #000000;
+            --tab-bg: #121212;
+            --tab-color: #94a3b8;
+            --tab-hover-bg: #222222;
+            --tab-active-bg: #000000;
+            --tab-active-color: #f3f4f6;
+        }
+        :root[data-theme="light"] {
+            --bg-color: #f4f6f8;
+            --text-color: #1f2937;
+            --card-bg: #ffffff;
+            --border-color: #d1d5db;
+            --meta-color: #4b5563;
+            --tabs-bg: #cfd5dc;
+            --tab-bg: #e4e8ed;
+            --tab-color: #4b5563;
+            --tab-hover-bg: #eef1f4;
+            --tab-active-bg: #f4f6f8;
+            --tab-active-color: #1f2937;
+        }
         {{ tabs_css|safe }}
-        #folder_path { width: 100%; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; box-sizing: border-box; }
-        #submit-btn { margin-top: 20px; padding: 10px 22px; background: #2563eb; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; display: none; }
-        body { font-family: "Segoe UI", Arial, sans-serif; background: #f4f6f8; margin: 0; padding: 40px; color: #1f2937; }
-        .container { max-width: 650px; margin: auto; background: white; padding: 35px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,.08); }
+        body { font-family: "Segoe UI", Arial, sans-serif; background: var(--bg-color); margin: 0; padding: 40px; color: var(--text-color); transition: background 0.3s, color 0.3s; }
+        .container { max-width: 650px; margin: auto; background: var(--card-bg); padding: 35px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,.15); border: 1px solid var(--border-color); }
         .nav-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .next-step-btn { background: #059669; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 13px; }
-        .next-step-btn:hover { background: #047857; }
-        h2 { margin-top: 0; }
-        input[type="text"] { width: 100%; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; box-sizing: border-box; }
+        .theme-switch-btn { background: var(--tab-bg); border: 1px solid var(--border-color); border-radius: 30px; width: 68px; height: 34px; display: flex; align-items: center; justify-content: space-between; padding: 0 4px; cursor: pointer; position: relative; transition: background 0.3s; }
+        .theme-switch-btn .icon { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; z-index: 2; transition: transform 0.3s, background 0.3s; }
+        .theme-switch-btn .sun { color: #f59e0b; }
+        .theme-switch-btn .moon { color: #94a3b8; }
+        :root[data-theme="dark"] .theme-switch-btn .sun { color: #64748b; }
+        :root[data-theme="dark"] .theme-switch-btn .moon { color: #38bdf8; }
+        .theme-switch-btn .knob { position: absolute; left: 4px; width: 26px; height: 26px; border-radius: 50%; background: #ffffff; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: transform 0.3s; z-index: 1; }
+        :root[data-theme="dark"] .theme-switch-btn .knob { transform: translateX(34px); background: #262626; }
+        h2 { margin-top: 0; color: var(--text-color); }
+        input[type="text"], select { width: 100%; padding: 12px; border: 1px solid var(--border-color); border-radius: 8px; font-size: 14px; box-sizing: border-box; background: var(--card-bg); color: var(--text-color); }
         #tex-list { 
             margin-top: 20px; 
             list-style: none; 
-            padding: 0; 
+            padding: 8px; 
             max-height: 220px; 
             overflow-y: auto; 
-            border: 1px solid #e5e7eb; 
+            border: 1px solid var(--border-color); 
             border-radius: 8px; 
-            background: #ffffff;
-            padding: 8px;
+            background: var(--card-bg);
         }
         #tex-list li { 
             padding: 10px; 
-            background: #f9fafb; 
+            background: var(--bg-color); 
             margin-bottom: 6px; 
             border-radius: 6px; 
-            border: 1px solid #eef0f3; 
+            border: 1px solid var(--border-color); 
             display: flex; 
             align-items: center; 
             gap: 10px; 
         }
-        #tex-list li:last-child {
-            margin-bottom: 0;
-        }
+        #tex-list li:last-child { margin-bottom: 0; }
         button { margin-top: 20px; padding: 10px 22px; background: #2563eb; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; display: none; }
         #loading-container { display: none; text-align: center; padding: 20px 0; }
-        table.steps-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; margin-top: 15px; box-shadow: 0 2px 8px rgba(0,0,0,.04); text-align: left; }
-        table.steps-table th, table.steps-table td { padding: 8px 12px; border-bottom: 1px solid #eef0f3; font-size: 13px; }
-        #pdf-list { margin-top: 8px; list-style: none; padding: 8px; max-height: 180px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 8px; background: #ffffff; }
-        #pdf-list li { padding: 10px; background: #f9fafb; margin-bottom: 6px; border-radius: 6px; border: 1px solid #eef0f3; display: flex; align-items: center; gap: 10px; }
+        table.steps-table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; margin-top: 15px; box-shadow: 0 2px 8px rgba(0,0,0,.04); text-align: left; border: 1px solid var(--border-color); }
+        table.steps-table th, table.steps-table td { padding: 8px 12px; border-bottom: 1px solid var(--border-color); font-size: 13px; color: var(--text-color); }
+        #pdf-list { margin-top: 8px; list-style: none; padding: 8px; max-height: 180px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; background: var(--card-bg); }
+        #pdf-list li { padding: 10px; background: var(--bg-color); margin-bottom: 6px; border-radius: 6px; border: 1px solid var(--border-color); display: flex; align-items: center; gap: 10px; }
         #pdf-list li:last-child { margin-bottom: 0; }
+        p { color: var(--text-color); }
     </style>
     </head>
     <body>
@@ -710,11 +788,15 @@ def index():
         <div class="container">
             <div class="nav-header">
                 <h2>Step 1: LaTeX Project Validator</h2>
+                <div class="theme-switch-btn" onclick="toggleTheme()" title="Toggle Dark/Light Mode">
+                    <div class="knob"></div>
+                    <div class="icon sun">☀️</div>
+                    <div class="icon moon">🌙</div>
+                </div>
             </div>
-            <div style="margin-bottom:12px;">
-                <label for="engine_select" style="font-size:13px; font-weight:600; color:#4b5563;">Compilation Engine:</label>
-                <select id="engine_select" style="margin-left:8px; padding:6px 10px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;">
-                    <!-- <option value="auto" selected>Auto-detect (pdflatex default)</option> -->
+            <div style="margin-bottom:12px; width: max-content;">
+                <label for="engine_select" style="font-size:13px; font-weight:600; color:var(--meta-color);">Compilation Engine:</label>
+                <select id="engine_select" style="margin-top:4px; padding:6px 10px;">
                     <option value="pdflatex">pdflatex</option>
                     <option value="lualatex">lualatex</option>
                     <option value="xelatex">xelatex</option>
@@ -730,13 +812,14 @@ def index():
                 <input type="hidden" id="main_tex_val" name="main_tex">
                 <ul id="tex-list"></ul>
                 <div id="pdf-section" style="display:none; margin-top:16px;">
-                    <div style="font-size:13px; font-weight:600; color:#4b5563;">Manuscript (MS) PDF not found. Select the PDF to compare against:</div>
+                    <div style="font-size:13px; font-weight:600; color:var(--meta-color);">Manuscript (MS) PDF not found. Select the PDF to compare against:</div>
                     <ul id="pdf-list"></ul>
                 </div>
             </form>
         </div>
         <script>
             let runLock = false;
+            let autoSelectedCancelled = false;
             const pathInput = document.getElementById('folder_path');
             const baseDirField = document.getElementById('base_dir');
             const mainTexField = document.getElementById('main_tex_val');
@@ -746,15 +829,21 @@ def index():
             const valForm = document.getElementById('valForm');
             const engineSelect = document.getElementById('engine_select');
 
-            // Auto-focus the input field instantly on load
             window.addEventListener('DOMContentLoaded', () => {
                 pathInput.focus();
             });
 
+            function toggleTheme() {
+                const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+                const nextTheme = isDark ? 'light' : 'dark';
+                document.documentElement.setAttribute('data-theme', nextTheme);
+                localStorage.setItem('latex_theme', nextTheme);
+            }
+
             function formatTime(sec) {
                 const m = Math.floor(sec / 60);
                 const s = sec % 60;
-                return `${m}mins ${s}sec`;
+                return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
             }
 
             async function getMsCheck(folderPath, texFile) {
@@ -804,9 +893,10 @@ def index():
                         if (docMatches.length === 1) msChk = await getMsCheck(folderPath, docMatches[0]);
                         hidePdfSection();
 
-                        if (docMatches.length === 1 && !msChk.needs_choice) {                            const detectedFile = docMatches[0];
-                        if (runLock) return;      // a second call (paste + input fire together) must not start another run
-                        runLock = true;
+                        if (!autoSelectedCancelled && docMatches.length === 1 && !msChk.needs_choice) {
+                            const detectedFile = docMatches[0];
+                            if (runLock) return;
+                            runLock = true;
                             mainTexField.value = detectedFile;
                             
                             valForm.style.display = 'none';
@@ -814,11 +904,11 @@ def index():
                             document.querySelector('p').style.display = 'none';
                             
                             loadingContainer.innerHTML = `
-                                <div style="font-size:15px; font-weight:600; color:#1f2937; margin-bottom:8px;">
+                                <div style="font-size:15px; font-weight:600; color:var(--text-color); margin-bottom:8px;">
                                     Detected main TeX file: <code style="color:#2563eb;">${detectedFile}</code>
                                 </div>
-                                <div id="countdown-text-container" style="font-size:13px; color:#6b7280; margin-bottom:14px;">Running validation, please wait... (<span id="elapsed-sec">0mins 0sec</span>)</div>
-                                <div style="width:100%; background:#e5e7eb; height:6px; border-radius:3px; overflow:hidden; margin-bottom:12px;">
+                                <div id="countdown-text-container" style="font-size:13px; color:var(--meta-color); margin-bottom:14px;">Running validation, please wait... (<span id="elapsed-sec">00:00</span>)</div>
+                                <div style="width:100%; background:var(--border-color); height:6px; border-radius:3px; overflow:hidden; margin-bottom:12px;">
                                     <div id="prog-bar" style="width:100%; background:#2563eb; height:100%;"></div>
                                 </div>
                                 <div id="live-steps-container" style="text-align:left;"></div>
@@ -847,7 +937,7 @@ def index():
                                 const stepsDiv = document.getElementById('live-steps-container');
                                 let stepsTable = document.createElement('table');
                                 stepsTable.className = 'steps-table';
-                                stepsTable.innerHTML = `<thead><tr><th>Pipeline Stage</th><th>Status</th><th>Started In</th><th>Duration</th></tr></thead><tbody id="steps-tbody"></tbody>`;
+                                stepsTable.innerHTML = `<thead><tr><th>Pipeline Stage</th><th>Status</th><th>Started In</th><th>Duration (MM:SS)</th></tr></thead><tbody id="steps-tbody"></tbody>`;
                                 stepsDiv.appendChild(stepsTable);
                                 const tbody = document.getElementById('steps-tbody');
 
@@ -857,6 +947,7 @@ def index():
                                         isFinished = true;
                                         clearInterval(timerInterval);
                                         eventSource.close();
+                                        runLock = false;
                                         window.location.href = data.report_url;
                                     } else if (data.status === 'engine') {
                                         engineSelect.value = data.engine;
@@ -864,6 +955,7 @@ def index():
                                         isFinished = true;
                                         clearInterval(timerInterval);
                                         eventSource.close();
+                                        runLock = false;
                                         alert(data.message);
                                         window.location.reload();
                                     } else {
@@ -892,13 +984,15 @@ def index():
                                     if (isFinished) return;
                                     isFinished = true;
                                     clearInterval(timerInterval);
-                                    eventSource.close();   // stops the browser's auto-reconnect, which would restart the whole pipeline
+                                    eventSource.close();
+                                    runLock = false;
                                     alert('Connection to the validator was lost before the run finished. Check the last stage shown in the table.');
                                 };
                             }, 3000);
 
                             document.getElementById('cancel-auto-btn').onclick = () => {
                                 runLock = false;
+                                autoSelectedCancelled = true;
                                 clearTimeout(timeoutId);
                                 clearInterval(timerInterval);
                                 loadingContainer.style.display = 'none';
@@ -906,7 +1000,7 @@ def index():
                                 pathInput.style.display = 'block';
                                 document.querySelector('p').style.display = 'block';
                                 fetchTexFiles();
-                                pathInput.focus(); // Refocus on cancel
+                                pathInput.focus();
                             };
                             return;
                         }
@@ -942,11 +1036,11 @@ def index():
                 document.querySelector('p').style.display = 'none';
 
                 loadingContainer.innerHTML = `
-                    <div style="font-size:15px; font-weight:600; color:#1f2937; margin-bottom:8px;">
+                    <div style="font-size:15px; font-weight:600; color:var(--text-color); margin-bottom:8px;">
                         Selected main TeX file: <code style="color:#2563eb;">${texFile}</code>
                     </div>
-                    <div style="font-size:13px; color:#6b7280; margin-bottom:14px;">Running validation, please wait... (<span id="elapsed-sec">0mins 0sec</span>)</div>
-                    <div style="width:100%; background:#e5e7eb; height:6px; border-radius:3px; overflow:hidden; margin-bottom:12px;">
+                    <div style="font-size:13px; color:var(--meta-color); margin-bottom:14px;">Running validation, please wait... (<span id="elapsed-sec">00:00</span>)</div>
+                    <div style="width:100%; background:var(--border-color); height:6px; border-radius:3px; overflow:hidden; margin-bottom:12px;">
                         <div style="width:100%; background:#2563eb; height:100%;"></div>
                     </div>
                     <div id="live-steps-container" style="text-align:left;"></div>
@@ -967,7 +1061,7 @@ def index():
                 const stepsDiv = document.getElementById('live-steps-container');
                 const stepsTable = document.createElement('table');
                 stepsTable.className = 'steps-table';
-                stepsTable.innerHTML = `<thead><tr><th>Pipeline Stage</th><th>Status</th><th>Started In</th><th>Duration</th></tr></thead><tbody id="steps-tbody"></tbody>`;
+                stepsTable.innerHTML = `<thead><tr><th>Pipeline Stage</th><th>Status</th><th>Started In</th><th>Duration (MM:SS)</th></tr></thead><tbody id="steps-tbody"></tbody>`;
                 stepsDiv.appendChild(stepsTable);
                 const tbody = document.getElementById('steps-tbody');
 
@@ -977,13 +1071,15 @@ def index():
                         isFinished = true;
                         clearInterval(timerInterval);
                         eventSource.close();
+                        runLock = false;
                         window.location.href = data.report_url;
                     } else if (data.status === 'engine') {
-                                        engineSelect.value = data.engine;
-                                    } else if (data.status === 'error') {
+                        engineSelect.value = data.engine;
+                    } else if (data.status === 'error') {
                         isFinished = true;
                         clearInterval(timerInterval);
                         eventSource.close();
+                        runLock = false;
                         alert(data.message);
                         window.location.reload();
                     } else {
@@ -1011,12 +1107,13 @@ def index():
                     if (isFinished) return;
                     isFinished = true;
                     clearInterval(timerInterval);
-                    eventSource.close();   // stops the browser's auto-reconnect, which would restart the whole pipeline
+                    eventSource.close();
+                    runLock = false;
                     alert('Connection to the validator was lost before the run finished. Check the last stage shown in the table.');
                 };
             }
-            pathInput.addEventListener('input', fetchTexFiles);
-            pathInput.addEventListener('paste', () => setTimeout(fetchTexFiles, 50));
+            pathInput.addEventListener('input', () => { autoSelectedCancelled = false; fetchTexFiles(); });
+            pathInput.addEventListener('paste', () => setTimeout(() => { autoSelectedCancelled = false; fetchTexFiles(); }, 50));
             texList.addEventListener('change', hidePdfSection);
             submitBtn.addEventListener('click', async () => {
                 const selected = document.querySelector('input[name="main_tex"]:checked');
@@ -1059,7 +1156,6 @@ def get_tex_files():
                         content = f.read()
                         if re.search(r'^[ \t]*\\documentclass', content, re.MULTILINE):
                             documentclass_matches.append(rel)
-                            print("DOCUMENTCLASS MATCH:", rel)
                 except Exception: pass
 
     suggested = documentclass_matches[0] if documentclass_matches else (tex_files[0] if tex_files else None)
@@ -1091,7 +1187,6 @@ def validate_manual():
     base_dir = request.form.get('base_dir', '').strip()
     main_tex_rel = request.form.get('main_tex', '').strip()
     validator = TexValidatorStreamer(os.path.join(base_dir, main_tex_rel))
-    # Run synchronously for manual click submissions
     for _ in validator.run_pipeline(): pass
     return send_from_directory(validator.dir_name, f"{validator.raw_base}_report.html")
 
@@ -1126,7 +1221,6 @@ _STEP2_RUNNING = set()
 _STEP2_LOCK = threading.Lock()
 
 LATEX_REGISTRY = {
-    # --- Mathematics, Proofs & Symbols ---
     "amsmath": {"commands": ["\\text", "\\numberwithin", "\\DeclareMathOperator", "\\eqref", "\\dots", "\\cfrac", "\\substack", "\\binom"], "environments": ["equation*", "align", "align*", "gather", "gather*", "multline", "multline*", "pmatrix", "bmatrix", "vmatrix", "cases", "split", "subarray"], "global": False},
     "amssymb": {"commands": ["\\mathbb", "\\mathcal", "\\mathfrak", "\\varnothing", "\\square", "\\checkmark", "\\angle", "\\nexists", "\\nsubseteq", "\\approxeq", "\\boxdot", "\\boxplus", "\\boxtimes", "\\complement", "\\doteqdot"], "environments": [], "global": False},
     "amsthm": {"commands": ["\\newtheorem", "\\theoremstyle", "\\theorembodyfont", "\\theoremheaderfont", "\\qedhere"], "environments": ["proof"], "global": False},
@@ -1138,16 +1232,12 @@ LATEX_REGISTRY = {
     "extarrows": {"commands": ["\\xlongequal", "\\xleftrightarrow", "\\xLongleftarrow", "\\xLonglongrightarrow"], "environments": [], "global": False},
     "mleftright": {"commands": ["\\mleft", "\\mright"], "environments": [], "global": False},
     "yhmath": {"commands": ["\\wideparen", "\\wideamalg", "\\widering"], "environments": [], "global": False},
-
-    # --- Physics, Chemistry & Biology ---
     "mhchem": {"commands": ["\\ce", "\\cf", "\\cee", "\\sfrac"], "environments": [], "global": False},
     "chemfig": {"commands": ["\\chemfig", "\\definesubmol", "\\polymerhtml", "\\charge", "\\Lewis"], "environments": [], "global": False},
     "physics": {"commands": ["\\dv", "\\pdv", "\\grad", "\\div", "\\rot", "\\bra", "\\ket", "\\braket", "\\innerprod", "\\matrixel", "\\comm", "\\acomm", "\\abs", "\\norm", "\\eval", "\\tr", "\\rank"], "environments": [], "global": False},
     "tikz-feynman": {"commands": ["\\feynman", "\\diagram"], "environments": ["feynman"], "global": False},
     "chemmacros": {"commands": ["\\ch", "\\chemsetup", "\\iupac", "\\state"], "environments": [], "global": False},
     "modiagram": {"commands": ["\\MOdiagram", "\\energy", "\\molecule"], "environments": ["AO"], "global": False},
-
-    # --- Graphics, Figures & Layout Construction ---
     "graphicx": {"commands": ["\\includegraphics", "\\graphicspath", "\\rotatebox", "\\resizebox", "\\scalebox", "\\DeclareGraphicsExtensions"], "environments": [], "global": False},
     "tikz": {"commands": ["\\tikz", "\\usetikzlibrary", "\\node", "\\draw", "\\path", "\\fill", "\\coordinates", "\\clip", "\\shadedraw"], "environments": ["tikzpicture", "scope"], "global": False},
     "pgfplots": {"commands": ["\\addplot", "\\pgfplotsset", "\\addlegendentry", "\\addlegendimage"], "environments": ["axis", "groupplot", "pgfplotsstabletypeset"], "global": False},
@@ -1160,8 +1250,6 @@ LATEX_REGISTRY = {
     "eso-pic": {"commands": ["\\AddToShipoutPicture", "\\AddToShipoutPictureBG", "\\ClearShipoutPicture"], "environments": [], "global": True},
     "transparent": {"commands": ["\\transparent"], "environments": [], "global": False},
     "adjustbox": {"commands": ["\\adjustbox", "\\newadjustbox"], "environments": ["adjustbox"], "global": False},
-
-    # --- Tables, Lists & Structuring ---
     "booktabs": {"commands": ["\\toprule", "\\midrule", "\\bottomrule", "\\cmidrule", "\\addlinespace", "\\morecmidrule"], "environments": [], "global": False},
     "tabularx": {"commands": ["\\tabularx"], "environments": ["tabularx"], "global": False},
     "array": {"commands": ["\\newcolumntype", "\\firsthline", "\\lasthline"], "environments": [], "global": False},
@@ -1173,16 +1261,12 @@ LATEX_REGISTRY = {
     "datatool": {"commands": ["\\dtlloadrawdb", "\\DTLforeach", "\\dtlcolumncount"], "environments": [], "global": False},
     "ltablex": {"commands": [], "environments": ["tabularx"], "global": True},
     "diagbox": {"commands": ["\\diagbox", "\\line"], "environments": [], "global": False},
-
-    # --- Code Listings, Pseudo-code & Text Verbatim ---
     "listings": {"commands": ["\\lstset", "\\lstinline", "\\lstinputlisting", "\\lstdefinestyle"], "environments": ["lstlisting"], "global": False},
     "minted": {"commands": ["\\mint", "\\mintinline", "\\usemintedstyle", "\\newminted", "\\inputminted"], "environments": ["minted"], "global": False},
     "algorithm2e": {"commands": ["\\KwIn", "\\KwOut", "\\If", "\\While", "\\SetAlgoLined", "\\DontPrintSemicolon", "\\Titleofalgo"], "environments": ["algorithm", "procedure", "function"], "global": False},
     "algorithmicx": {"commands": ["\\State", "\\For", "\\If", "\\While", "\\ElsIf", "\\EndFor"], "environments": ["algorithmic"], "global": False},
     "algpseudocode": {"commands": ["\\Procedure", "\\Method", "\\While", "\\For", "\\If"], "environments": ["algorithmic"], "global": False},
     "fancyvrb": {"commands": ["\\DefineShortVerb", "\\UndefineShortVerb", "\\fvset"], "environments": ["Verbatim"], "global": False},
-
-    # --- Typography, Overrides, Layouts & Localization ---
     "geometry": {"commands": ["\\geometry", "\\newgeometry", "\\restoregeometry"], "environments": [], "global": True},
     "microtype": {"commands": ["\\microtypesetup", "\\DeclareMicrotypeSet"], "environments": [], "global": True},
     "babel": {"commands": ["\\selectlanguage", "\\iflanguage", "\\babeltags"], "environments": [], "global": True},
@@ -1195,13 +1279,9 @@ LATEX_REGISTRY = {
     "indentfirst": {"commands": [], "environments": [], "global": True},
     "footmisc": {"commands": ["\\footnote", "\\footnotemark", "\\footnotetext"], "environments": [], "global": True},
     "chngcntr": {"commands": ["\\counterwithin", "\\counterwithout"], "environments": [], "global": True},
-
-    # --- Bibliographies & Citations ---
     "natbib": {"commands": ["\\citep", "\\citet", "\\citealp", "\\citealt", "\\citeauthor", "\\citeyear", "\\bibliographystyle"], "environments": [], "global": False},
     "biblatex": {"commands": ["\\addbibresource", "\\printbibliography", "\\autocite", "\\citefield"], "environments": [], "global": False},
     "cite": {"commands": ["\\cite", "\\nocite"], "environments": [], "global": False},
-
-    # --- Humanities, Linguistics & Miscellaneous ---
     "qtree": {"commands": ["\\Tree"], "environments": [], "global": False},
     "forest": {"commands": ["\\forestset"], "environments": ["forest"], "global": False},
     "blindtext": {"commands": ["\\blindtext", "\\Blindtext", "\\blinddocument"], "environments": [], "global": False},
@@ -1210,14 +1290,11 @@ LATEX_REGISTRY = {
 
 PKG_RE = re.compile(r'\\(usepackage|RequirePackage)(?:\s*\[(.*?)\])?\s*\{(.*?)\}', re.S)
 
-
 def _in_comment(text, pos):
     ls = text.rfind('\n', 0, pos) + 1
     return re.search(r'(?<!\\)%', text[ls:pos]) is not None
 
-
 def resolve_tex_content(file_path, base_dir, visited=None):
-    """Returns the file text plus the text of every \\input / \\include target (recursively). Used for usage analysis only."""
     if visited is None:
         visited = set()
     path = os.path.normpath(os.path.abspath(file_path))
@@ -1237,9 +1314,7 @@ def resolve_tex_content(file_path, base_dir, visited=None):
         parts.append(resolve_tex_content(os.path.join(base_dir, m.group(1).strip()), base_dir, visited))
     return "\n".join(parts)
 
-
 def find_unused_packages(main_text, analysis_text):
-    # Same decision logic as find.py: a registry package is "used" if any of its commands/environments appears in active text
     declared = []
     for m in PKG_RE.finditer(main_text):
         if _in_comment(main_text, m.start()):
@@ -1255,16 +1330,14 @@ def find_unused_packages(main_text, analysis_text):
     for pkg in declared:
         rules = LATEX_REGISTRY.get(pkg)
         if not rules or rules.get("global", False):
-            continue                      # unknown packages and global-effect packages are always kept
+            continue
         cmds = rules.get("commands") or []
         envs = rules.get("environments") or []
         if not any(c in found_commands for c in cmds) and not any(e in found_environments for e in envs):
             remove.append(pkg)
     return remove
 
-
 def remove_unused_packages(text, remove_packages):
-    # Comments out statements whose packages are all unused; rewrites statements that mix used and unused packages
     remove_set = set(remove_packages)
     eol = '\r\n' if '\r\n' in text else '\n'
     removed = []
@@ -1276,7 +1349,7 @@ def remove_unused_packages(text, remove_packages):
         keep = [p for p in pkgs if p not in remove_set]
         drop = [p for p in pkgs if p in remove_set]
         if not drop:
-            return m.group(0)             # nothing to remove: leave the original text untouched
+            return m.group(0)
         removed.extend(drop)
         if keep:
             opts = "[" + m.group(2) + "]" if m.group(2) else ""
@@ -1292,7 +1365,6 @@ def remove_unused_packages(text, remove_packages):
     return new_text, list(dict.fromkeys(removed))
 
 def get_all_linked_tex_files(file_path, base_dir, found_paths=None):
-    r"""Recursively resolves all actual absolute file paths references via \input or \include statements."""
     if found_paths is None:
         found_paths = set()
     path = os.path.normpath(os.path.abspath(file_path))
@@ -1307,7 +1379,6 @@ def get_all_linked_tex_files(file_path, base_dir, found_paths=None):
     except Exception:
         return found_paths
         
-    # FIXED: The broken "(?--)" flag has been completely removed
     active = "\n".join(re.sub(r'(?<!\\)%.*$', '', ln) for ln in content.splitlines())
     for m in re.finditer(r'\\(?:input|include)\s*\{([^}]+)\}', active):
         target_name = m.group(1).strip()
@@ -1315,10 +1386,7 @@ def get_all_linked_tex_files(file_path, base_dir, found_paths=None):
         get_all_linked_tex_files(target_path, base_dir, found_paths)
     return found_paths
 
-
 def comment_specific_packages_and_fonts(text):
-    """Comments out mandatory package listings and fonts per business guidelines."""
-    # Packages blacklist
     blacklist_pkgs = {"amsmath", "amssymb", "amsthm", "amsfonts", "stmaryrd", "latexsym", "mathabx", "txfonts"}
     
     def pkg_replacer(m):
@@ -1334,7 +1402,6 @@ def comment_specific_packages_and_fonts(text):
 
     processed_text = PKG_RE.sub(pkg_replacer, text)
 
-    # Font commands blacklist
     font_commands = ["setmainfont", "setromanfont", "setsansfont", "setmonofont"]
     for cmd in font_commands:
         pattern = r'(?<!\\)\\' + cmd + r'\b(?:\s*\[.*?\])?\s*\{.*?\}'
@@ -1347,7 +1414,6 @@ def comment_specific_packages_and_fonts(text):
     return processed_text
 
 def insert_make_chapter_title(text):
-    r"""Inserts \makechaptertitle on a new line right below any active \chapter macro."""
     eol = '\r\n' if '\r\n' in text else '\n'
     pattern = r'(?<!\\)\\chapter\s*(?:\[[^\]]*\])?\s*\{'
     lines = text.splitlines(keepends=True)
@@ -1355,7 +1421,6 @@ def insert_make_chapter_title(text):
 
     for line in lines:
         modified_lines.append(line)
-        # FIXED: Removed the broken "(?--)" token from this regex engine call as well
         clean_code = re.sub(r'(?<!\\)%.*$', '', line)
         if re.search(pattern, clean_code):
             indentation = re.match(r'^\s*', line).group(0)
@@ -1363,17 +1428,14 @@ def insert_make_chapter_title(text):
 
     return "".join(modified_lines)
 
-
-
 def step2_transform(text, new_class_line):
-    # Returns (new_text, documentclass_replaced)
-    out, class_done, pending_drop = [], False, 0     # pending_drop = open [ { depth of a multi-line \documentclass
+    out, class_done, pending_drop = [], False, 0
     for line in re.split(r'(?<=\n)', text):
         body = line.rstrip('\r\n')
         eol = line[len(body):]
         code = re.sub(r'(?<!\\)%.*$', '', body)
         depth = code.count('[') + code.count('{') - code.count(']') - code.count('}')
-        if pending_drop > 0:                          # continuation of a multi-line \documentclass
+        if pending_drop > 0:
             pending_drop = max(0, pending_drop + depth)
             continue
         if not class_done and re.match(r'\s*\\documentclass\b', code):
@@ -1383,7 +1445,6 @@ def step2_transform(text, new_class_line):
             continue
         out.append(line)
     return ''.join(out), class_done
-
 
 def step2_pipeline(file_path, new_class_line):
     def ev(idx, step, status, tm):
@@ -1402,13 +1463,11 @@ def step2_pipeline(file_path, new_class_line):
         yield err('Source file not found.')
         return
 
-    # Stage 1: backup + replacements
     step1 = '1. Process layout configurations across project files'
     yield ev(0, step1, 'Running...', '...')
     t0 = time.time()
 
     try:
-        # Find all dependent files from the root tree mapping recursively
         all_project_files = get_all_linked_tex_files(file_path, dir_name)
 
         for current_file in all_project_files:
@@ -1423,7 +1482,6 @@ def step2_pipeline(file_path, new_class_line):
             except UnicodeDecodeError:
                 text, enc = raw.decode('latin-1'), 'latin-1'
 
-            # Documentclass switch logic applies strictly to the main root file
             if os.path.normpath(current_file) == os.path.normpath(file_path):
                 text, class_done = step2_transform(text, new_class_line)
                 if not class_done:
@@ -1432,7 +1490,6 @@ def step2_pipeline(file_path, new_class_line):
                 unused = find_unused_packages(text, resolve_tex_content(bak, dir_name))
                 text, removed = remove_unused_packages(text, unused)
 
-            # Package exclusions, font blocks, and chapter modifications apply to ALL files
             text = comment_specific_packages_and_fonts(text)
             text = insert_make_chapter_title(text)
 
@@ -1443,9 +1500,12 @@ def step2_pipeline(file_path, new_class_line):
         yield err(f'Could not modify the project files: {type(e).__name__}: {e}')
         return
 
-    yield ev(0, step1, 'Completed - Package restrictions, Font filters and Chapter title setups applied.', f"{time.time() - t0:.2f}s")
+    def fmt_secs(s):
+        s = int(round(s))
+        return f"{s // 60:02d}:{s % 60:02d}"
 
-    # Stage 2 & 3: xelatex twice
+    yield ev(0, step1, 'Completed - Package restrictions, Font filters and Chapter title setups applied.', fmt_secs(time.time() - t0))
+
     xelatex_exe = r"\\integra-net\TeXLive\texlive\2019\bin\win32\xelatex.exe"
     if not os.path.exists(xelatex_exe):
         xelatex_exe = shutil.which("xelatex") or xelatex_exe
@@ -1466,7 +1526,7 @@ def step2_pipeline(file_path, new_class_line):
         while p.poll() is None:
             time.sleep(2)
             yield ": keepalive\n\n"
-        yield ev(n, step, 'Completed', f"{time.time() - t0:.2f}s")
+        yield ev(n, step, 'Completed', fmt_secs(time.time() - t0))
 
     errs = []
     if os.path.exists(log_path):
@@ -1474,8 +1534,6 @@ def step2_pipeline(file_path, new_class_line):
             errs = [m.strip() for m in re.findall(r'^!(.*)$', f.read(), re.M)]
     pdf_ok = os.path.exists(pdf_path) and (pdf_before is None or os.path.getmtime(pdf_path) != pdf_before)
     yield f"data: {json.dumps({'status': 'finished', 'pdf_ok': pdf_ok, 'pdf_name': base + '.pdf', 'pdf_path': pdf_path, 'log_path': log_path, 'error_count': len(errs), 'errors': errs[:10], 'elapsed': round(time.time() - t_start, 1)})}\n\n"
-
-
 
 def step2_guarded(file_path, new_class_line):
     key = os.path.normcase(os.path.abspath(file_path))
@@ -1492,7 +1550,6 @@ def step2_guarded(file_path, new_class_line):
         with _STEP2_LOCK:
             _STEP2_RUNNING.discard(key)
 
-
 @app.route('/stream_step2', methods=['GET'])
 def stream_step2():
     base_dir = request.args.get('base_dir', '').strip()
@@ -1500,43 +1557,78 @@ def stream_step2():
     class_line = request.args.get('class_line', '').strip()
     
     if not re.match(r'\\documentclass\b', class_line) or '\n' in class_line or '\r' in class_line:
-        # Fixed: Serialized data string is constructed completely outside of the f-string braces
         error_data = json.dumps({'status': 'error', 'message': 'The replacement must be a single line starting with \\\\documentclass.'})
         return Response(f"data: {error_data}\n\n", mimetype='text/event-stream')
         
     return Response(step2_guarded(os.path.join(base_dir, main_tex), class_line), mimetype='text/event-stream')
 
-
-
 STEP2_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
-<head><title>Step 2: Documentclass Swap & XeLaTeX</title>
-<meta charset="UTF-8">
+<head>
+<meta charset="UTF-8"><title>Step 2: Documentclass Swap & XeLaTeX</title>
+<script>
+    (function() {
+        const savedTheme = localStorage.getItem('latex_theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+    })();
+</script>
 <style>
+    :root {
+        --bg-color: #000000;
+        --text-color: #f3f4f6;
+        --card-bg: #121212;
+        --border-color: #262626;
+        --meta-color: #94a3b8;
+        --tabs-bg: #000000;
+        --tab-bg: #121212;
+        --tab-color: #94a3b8;
+        --tab-hover-bg: #222222;
+        --tab-active-bg: #000000;
+        --tab-active-color: #f3f4f6;
+    }
+    :root[data-theme="light"] {
+        --bg-color: #f4f6f8;
+        --text-color: #1f2937;
+        --card-bg: #ffffff;
+        --border-color: #d1d5db;
+        --meta-color: #4b5563;
+        --tabs-bg: #cfd5dc;
+        --tab-bg: #e4e8ed;
+        --tab-color: #4b5563;
+        --tab-hover-bg: #eef1f4;
+        --tab-active-bg: #f4f6f8;
+        --tab-active-color: #1f2937;
+    }
     {{ tabs_css|safe }}
-    body { font-family: "Segoe UI", Arial, sans-serif; background: #f4f6f8; margin: 0; padding: 40px; color: #1f2937; }
-    .container { max-width: 650px; margin: auto; background: white; padding: 35px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,.08); }
+    body { font-family: "Segoe UI", Arial, sans-serif; background: var(--bg-color); margin: 0; padding: 40px; color: var(--text-color); transition: background 0.3s, color 0.3s; }
+    .container { max-width: 650px; margin: auto; background: var(--card-bg); padding: 35px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,.15); border: 1px solid var(--border-color); }
     .nav-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-    .arrow-btn { color: #059669; font-size: 30px; font-weight: 700; line-height: 1; text-decoration: none; }
-    .arrow-btn:hover { color: #047857; }
-    h2 { margin-top: 0; }
-    label.lbl { display: block; font-size: 13px; font-weight: 600; color: #4b5563; margin: 16px 0 6px; }
-    input[type="text"] { width: 100%; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; box-sizing: border-box; }
+    .theme-switch-btn { background: var(--tab-bg); border: 1px solid var(--border-color); border-radius: 30px; width: 68px; height: 34px; display: flex; align-items: center; justify-content: space-between; padding: 0 4px; cursor: pointer; position: relative; transition: background 0.3s; }
+    .theme-switch-btn .icon { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; z-index: 2; transition: transform 0.3s, background 0.3s; }
+    .theme-switch-btn .sun { color: #f59e0b; }
+    .theme-switch-btn .moon { color: #94a3b8; }
+    :root[data-theme="dark"] .theme-switch-btn .sun { color: #64748b; }
+    :root[data-theme="dark"] .theme-switch-btn .moon { color: #38bdf8; }
+    .theme-switch-btn .knob { position: absolute; left: 4px; width: 26px; height: 26px; border-radius: 50%; background: #ffffff; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: transform 0.3s; z-index: 1; }
+    :root[data-theme="dark"] .theme-switch-btn .knob { transform: translateX(34px); background: #262626; }
+    h2 { margin-top: 0; color: var(--text-color); }
+    label.lbl { display: block; font-size: 13px; font-weight: 600; color: var(--meta-color); margin: 16px 0 6px; }
+    input[type="text"] { width: 100%; padding: 12px; border: 1px solid var(--border-color); border-radius: 8px; font-size: 14px; box-sizing: border-box; background: var(--card-bg); color: var(--text-color); }
     input[type="text"].mono { font-family: Consolas, monospace; }
-    #tex-list { margin-top: 12px; list-style: none; padding: 8px; max-height: 200px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }
+    #tex-list { margin-top: 12px; list-style: none; padding: 8px; max-height: 200px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; background: var(--card-bg); }
     #tex-list:empty { display: none; }
-    #tex-list li { padding: 10px; background: #f9fafb; margin-bottom: 6px; border-radius: 6px; border: 1px solid #eef0f3; display: flex; align-items: center; gap: 10px; }
+    #tex-list li { padding: 10px; background: var(--bg-color); margin-bottom: 6px; border-radius: 6px; border: 1px solid var(--border-color); display: flex; align-items: center; gap: 10px; }
     #tex-list li:last-child { margin-bottom: 0; }
     #run-btn { margin-top: 20px; padding: 10px 22px; background: #2563eb; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
     #run-btn:disabled { opacity: .5; cursor: not-allowed; }
     #progress { display: none; margin-top: 20px; }
-    table.steps-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.04); text-align: left; }
-    table.steps-table th, table.steps-table td { padding: 8px 12px; border-bottom: 1px solid #eef0f3; font-size: 13px; }
+    table.steps-table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.04); text-align: left; border: 1px solid var(--border-color); }
+    table.steps-table th, table.steps-table td { padding: 8px 12px; border-bottom: 1px solid var(--border-color); font-size: 13px; color: var(--text-color); }
     #result { display: none; margin-top: 20px; }
     .ok { background: #ecfdf5; color: #047857; padding: 14px; border-radius: 10px; font-weight: 600; }
     .bad { background: #fef2f2; color: #b91c1c; padding: 14px; border-radius: 10px; font-weight: 600; }
-    pre.errs { background: #f9fafb; color: #4b5563; font-size: 12.5px; padding: 10px 14px; border-radius: 8px; white-space: pre-wrap; margin: 10px 0 0; }
+    pre.errs { background: var(--bg-color); color: var(--text-color); font-size: 12.5px; padding: 10px 14px; border-radius: 8px; white-space: pre-wrap; margin: 10px 0 0; border: 1px solid var(--border-color); }
     .links { margin-top: 12px; display: flex; gap: 14px; }
     .links a { color: #2563eb; font-weight: 600; font-size: 13px; text-decoration: none; }
     .links a:hover { text-decoration: underline; }
@@ -1547,6 +1639,11 @@ STEP2_HTML = r"""
 <div class="container">
     <div class="nav-header">
         <h2>Step 2: Documentclass Swap & XeLaTeX</h2>
+        <div class="theme-switch-btn" onclick="toggleTheme()" title="Toggle Dark/Light Mode">
+            <div class="knob"></div>
+            <div class="icon sun">☀️</div>
+            <div class="icon moon">🌙</div>
+        </div>
     </div>
     <label class="lbl" for="folder_path">Project folder path:</label>
     <input type="text" id="folder_path" placeholder="e.g., C:\itools\WMS\WorkingFolder" autocomplete="off">
@@ -1567,7 +1664,16 @@ STEP2_HTML = r"""
     let running = false;
     let fetchSeq = 0;
 
-    window.addEventListener('DOMContentLoaded', () => pathInput.focus());
+    window.addEventListener('DOMContentLoaded', () => {
+        pathInput.focus();
+    });
+
+    function toggleTheme() {
+        const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+        const nextTheme = isDark ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', nextTheme);
+        localStorage.setItem('latex_theme', nextTheme);
+    }
 
     function esc(s) {
         return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -1584,7 +1690,7 @@ STEP2_HTML = r"""
         try {
             const r = await fetch('/get_tex_files', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ folder_path: folder }) });
             const data = await r.json();
-            if (seq !== fetchSeq) return;     // ignore stale responses
+            if (seq !== fetchSeq) return;
             texList.innerHTML = '';
             if (!data.files || data.files.length === 0) {
                 texList.innerHTML = '<li style="color:#b91c1c;">No .tex files found.</li>';
@@ -1643,7 +1749,7 @@ STEP2_HTML = r"""
         updateRunBtn();
         resultBox.style.display = 'none';
         resultBox.innerHTML = '';
-        progress.innerHTML = `<table class="steps-table"><thead><tr><th>Pipeline Stage</th><th>Status</th><th>Started In</th><th>Duration</th></tr></thead><tbody id="steps-tbody"></tbody></table>`;
+        progress.innerHTML = `<table class="steps-table"><thead><tr><th>Pipeline Stage</th><th>Status</th><th>Started In</th><th>Duration (MM:SS)</th></tr></thead><tbody id="steps-tbody"></tbody></table>`;
         progress.style.display = 'block';
 
         const es = new EventSource(`/stream_step2?base_dir=${encodeURIComponent(folder)}&main_tex=${encodeURIComponent(file)}&class_line=${encodeURIComponent(line)}`);
@@ -1661,7 +1767,7 @@ STEP2_HTML = r"""
         es.onerror = function() {
             if (done) return;
             done = true;
-            es.close();     // stops the browser's auto-reconnect, which would start the run again
+            es.close();
             running = false;
             updateRunBtn();
             showError('Connection to the app was lost before the run finished. Check the last stage shown above.');
@@ -1685,7 +1791,6 @@ STEP2_HTML = r"""
 </html>
 """
 
-
 @app.route('/step2', methods=['GET'])
 def step2_page():
     return render_template_string(STEP2_HTML, tabs_css=TABS_CSS, tabs=tabs_html('castoff', bleed=True))
@@ -1699,38 +1804,77 @@ STEP3_HTML = r"""
 <head>
 <meta charset="UTF-8">
 <title>Step 3: TeX File Sequence Manager</title>
+<script>
+    (function() {
+        const savedTheme = localStorage.getItem('latex_theme') || 'dark';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+    })();
+</script>
 <style>
+    :root {
+        --bg-color: #000000;
+        --text-color: #f3f4f6;
+        --card-bg: #121212;
+        --border-color: #262626;
+        --meta-color: #94a3b8;
+        --tabs-bg: #000000;
+        --tab-bg: #121212;
+        --tab-color: #94a3b8;
+        --tab-hover-bg: #222222;
+        --tab-active-bg: #000000;
+        --tab-active-color: #f3f4f6;
+    }
+    :root[data-theme="light"] {
+        --bg-color: #f4f6f8;
+        --text-color: #1f2937;
+        --card-bg: #ffffff;
+        --border-color: #d1d5db;
+        --meta-color: #4b5563;
+        --tabs-bg: #cfd5dc;
+        --tab-bg: #e4e8ed;
+        --tab-color: #4b5563;
+        --tab-hover-bg: #eef1f4;
+        --tab-active-bg: #f4f6f8;
+        --tab-active-color: #1f2937;
+    }
     {{ tabs_css|safe }}
-    body { font-family: "Segoe UI", Arial, sans-serif; background: #f4f6f8; margin: 0; padding: 40px; color: #1f2937; }
-    .container { max-width: 650px; margin: auto; background: white; padding: 35px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,.08); }
+    body { font-family: "Segoe UI", Arial, sans-serif; background: var(--bg-color); margin: 0; padding: 40px; color: var(--text-color); transition: background 0.3s, color 0.3s; }
+    .container { max-width: 650px; margin: auto; background: var(--card-bg); padding: 35px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,.15); border: 1px solid var(--border-color); }
     .nav-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-    h2 { margin-top: 0; }
-    label.lbl { display: block; font-size: 13px; font-weight: 600; color: #4b5563; margin: 16px 0 6px; }
-    input[type="text"] { width: 100%; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; box-sizing: border-box; }
-    #fileList { margin-top: 20px; list-style: none; padding: 8px; max-height: 220px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 8px; background: #ffffff; }
-    #fileList.drag-active { border-color: #2563eb; background: #eff6ff; }
-    .drop-placeholder { padding: 20px; color: #6b7280; font-size: 13px; text-align: center; }
-    .file-item { padding: 10px; background: #f9fafb; margin-bottom: 6px; border-radius: 6px; border: 1px solid #eef0f3; display: flex; align-items: center; gap: 10px; cursor: grab; }
+    .theme-switch-btn { background: var(--tab-bg); border: 1px solid var(--border-color); border-radius: 30px; width: 68px; height: 34px; display: flex; align-items: center; justify-content: space-between; padding: 0 4px; cursor: pointer; position: relative; transition: background 0.3s; }
+    .theme-switch-btn .icon { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; z-index: 2; transition: transform 0.3s, background 0.3s; }
+    .theme-switch-btn .sun { color: #f59e0b; }
+    .theme-switch-btn .moon { color: #94a3b8; }
+    :root[data-theme="dark"] .theme-switch-btn .sun { color: #64748b; }
+    :root[data-theme="dark"] .theme-switch-btn .moon { color: #38bdf8; }
+    .theme-switch-btn .knob { position: absolute; left: 4px; width: 26px; height: 26px; border-radius: 50%; background: #ffffff; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: transform 0.3s; z-index: 1; }
+    :root[data-theme="dark"] .theme-switch-btn .knob { transform: translateX(34px); background: #262626; }
+    h2 { margin-top: 0; color: var(--text-color); }
+    label.lbl { display: block; font-size: 13px; font-weight: 600; color: var(--meta-color); margin: 16px 0 6px; }
+    input[type="text"] { width: 100%; padding: 12px; border: 1px solid var(--border-color); border-radius: 8px; font-size: 14px; box-sizing: border-box; background: var(--card-bg); color: var(--text-color); }
+    #fileList { margin-top: 20px; list-style: none; padding: 8px; max-height: 220px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; background: var(--card-bg); }
+    #fileList.drag-active { border-color: #2563eb; background: var(--bg-color); }
+    .drop-placeholder { padding: 20px; color: var(--meta-color); font-size: 13px; text-align: center; }
+    .file-item { padding: 10px; background: var(--bg-color); margin-bottom: 6px; border-radius: 6px; border: 1px solid var(--border-color); display: flex; align-items: center; gap: 10px; cursor: grab; }
     .file-item:last-child { margin-bottom: 0; }
-    .file-item:hover { background: #eef1f4; }
-    .file-item:active { cursor: grabbing; }
     .file-item.dragging { opacity: .4; }
-    .drag-handle { width: 20px; color: #94a3b8; font-size: 16px; user-select: none; }
-    .number { width: 30px; color: #64748b; font-family: Consolas, monospace; font-size: 13px; }
-    .filename { flex: 1; font-family: Consolas, monospace; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .drag-handle { width: 20px; color: var(--meta-color); font-size: 16px; user-select: none; }
+    .number { width: 30px; color: var(--meta-color); font-family: Consolas, monospace; font-size: 13px; }
+    .filename { flex: 1; font-family: Consolas, monospace; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-color); }
     .expected { width: 180px; text-align: left; color: #2563eb; font-size: 12px; font-family: Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .ignore-box { width: 70px; margin: 0; display: flex; align-items: center; gap: 6px; color: #64748b; font-size: 12px; cursor: pointer; user-select: none; }
+    .ignore-box { width: 70px; margin: 0; display: flex; align-items: center; gap: 6px; color: var(--meta-color); font-size: 12px; cursor: pointer; user-select: none; }
     .ignore-box input { width: 15px; height: 15px; cursor: pointer; }
-    .file-item.ignored { opacity: 0.5; background: #f1f5f9; }
-    .file-item.ignored .filename { text-decoration: line-through; color: #64748b; }
-    .file-item.ignored .expected { color: #94a3b8; }
-    .info-panel { margin-top: 20px; background: #f9fafb; border: 1px solid #eef0f3; border-radius: 8px; padding: 12px; font-size: 12.5px; color: #4b5563; line-height: 1.6; }
-    .info-panel b { color: #1f2937; }
+    .file-item.ignored { opacity: 0.5; background: var(--border-color); }
+    .file-item.ignored .filename { text-decoration: line-through; color: var(--meta-color); }
+    .file-item.ignored .expected { color: var(--meta-color); }
+    .info-panel { margin-top: 20px; background: var(--bg-color); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; font-size: 12.5px; color: var(--meta-color); line-height: 1.6; }
+    .info-panel b { color: var(--text-color); }
     #renameButton { margin-top: 20px; padding: 10px 22px; background: #2563eb; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; width: 100%; text-align: center; }
     #renameButton:disabled { opacity: .5; cursor: not-allowed; }
     .message { margin-top: 18px; padding: 14px; border-radius: 10px; font-weight: 600; display: none; font-size: 13px; }
     .message.success { display: block; background: #ecfdf5; color: #047857; }
     .message.error { display: block; background: #fef2f2; color: #b91c1c; }
+    p { color: var(--text-color); }
 </style>
 </head>
 <body>
@@ -1738,6 +1882,11 @@ STEP3_HTML = r"""
     <div class="container">
         <div class="nav-header">
             <h2>Step 3: TeX File Sequence Manager</h2>
+            <div class="theme-switch-btn" onclick="toggleTheme()" title="Toggle Dark/Light Mode">
+                <div class="knob"></div>
+                <div class="icon sun">☀️</div>
+                <div class="icon moon">🌙</div>
+            </div>
         </div>
         <p>Paste your project folder path below:</p>
         <input type="text" id="folder" placeholder="e.g., C:\itools\WMS\WorkingFolder" autocomplete="off">
@@ -1757,9 +1906,19 @@ STEP3_HTML = r"""
 <script>
 let files = [];
 let draggedIndex = null;
+let isProcessing = false;
 const $ = id => document.getElementById(id);
-$("folder").addEventListener("paste", () => setTimeout(loadFiles, 50));
-$("folder").addEventListener("change", () => loadFiles());
+
+function toggleTheme() {
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    const nextTheme = isDark ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', nextTheme);
+    localStorage.setItem('latex_theme', nextTheme);
+}
+
+$("folder").addEventListener("paste", () => setTimeout(() => { isProcessing = true; loadFiles().finally(() => { isProcessing = false; }); }, 50));
+$("folder").addEventListener("change", () => { isProcessing = true; loadFiles().finally(() => { isProcessing = false; }); });
+
 function buildName(s, p) { return s === 0 ? "00-"+p+"-Prelims.tex" : String(s).padStart(2,"0")+"-"+p+"-Ch"+String(s).padStart(2,"0")+".tex"; }
 async function loadFiles(silent = false) {
     const folder = $("folder").value.trim();
@@ -1801,13 +1960,13 @@ async function renameFiles() {
     let preview = ""; let seq = 0; files.forEach(file => { preview += file.name + "  ->  " + (file.ignored ? "IGNORED" : buildName(seq, prefix)) + "\n"; if (!file.ignored) seq++; });
     if (!confirm("Confirm sequential updates:\n\n" + preview)) return;
     const button = $("renameButton"); button.disabled = true; button.innerText = "Renaming...";
+    isProcessing = true;
     try {
         const response = await fetch("/execute_rename", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folder: folder, prefix: prefix, files: files.map(f => ({ name: f.name, ignored: f.ignored })) }) });
         const data = await response.json(); if (!data.success) { showMessage(data.message, true); return; }
         await loadFiles(true); showMessage(data.message, false);
-    } catch (error) { showMessage("Rename operation failed.", true); } finally { button.disabled = files.length === 0; button.innerText = "Rename Files"; }
+    } catch (error) { showMessage("Rename operation failed.", true); } finally { button.disabled = files.length === 0; button.innerText = "Rename Files"; isProcessing = false; }
 }
-
 
 function showMessage(text, error) { 
     const el = $("message"); 
@@ -1821,7 +1980,6 @@ function escapeHtml(text) {
                .replace(/"/g, '&quot;')
                .replace(/'/g, '&#039;'); 
 }
-
 </script>
 </body>
 </html>
@@ -1907,7 +2065,7 @@ def execute_rename():
 
 
 if __name__ == '__main__':
-    if len(sys.argv) >= 5 and sys.argv[1] == '--diff':      # child process mode (used by _compare_pdfs_isolated)
+    if len(sys.argv) >= 5 and sys.argv[1] == '--diff':
         import faulthandler; faulthandler.enable()
         v = TexValidatorStreamer(sys.argv[2])
         res = v._compare_pdfs(sys.argv[3], sys.argv[4], progress=lambda d, t: print(f"PROGRESS {d} {t}", flush=True))
@@ -1917,6 +2075,6 @@ if __name__ == '__main__':
 
     import faulthandler, tempfile
     _crash_log = open(os.path.join(tempfile.gettempdir(), 'latex_validator_crash.log'), 'a')
-    faulthandler.enable(_crash_log)     # any future hard crash of the app itself writes a traceback here
-    webview.create_window('LaTeX Project Validator & Manager', app, width=1150, height=750)
+    faulthandler.enable(_crash_log)
+    webview.create_window('TeXi', app, maximized=True)
     webview.start()
